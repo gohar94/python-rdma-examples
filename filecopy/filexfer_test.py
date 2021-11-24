@@ -4,6 +4,7 @@ import socket
 import contextlib
 import os, sys
 import time
+import threading
 from mmap import mmap
 from collections import namedtuple
 import rdma.ibverbs as ibv;
@@ -24,14 +25,14 @@ class Endpoint(object):
     mr = None;
     peerinfo = None;
 
-    def __init__(self,fp,sz,dev):
+    def __init__(self,mem,sz,dev):
         self.ctx = rdma.get_verbs(dev)
         self.cc = self.ctx.comp_channel();
         self.cq = self.ctx.cq(2*tx_depth,self.cc)
         self.poller = rdma.vtools.CQPoller(self.cq);
         self.pd = self.ctx.pd()
         self.qp = self.pd.qp(ibv.IBV_QPT_RC,tx_depth,self.cq,tx_depth,self.cq);
-        self.mem = mmap(fp, sz)
+        self.mem = mem
         self.mr = self.pd.mr(self.mem,
                              ibv.IBV_ACCESS_LOCAL_WRITE|ibv.IBV_ACCESS_REMOTE_WRITE)
         self.size = sz
@@ -87,9 +88,15 @@ class Endpoint(object):
         print "%.1f MB/sec" % rate
 
 def client_mode(hostname,infilename,dev):
-    f = open(infilename, "r+")
-    sz = os.path.getsize(infilename)
-    with Endpoint(f.fileno(), sz, dev) as end:
+    # f = open(infilename, "r+")
+    # sz = os.path.getsize(infilename)
+    # with Endpoint(f.fileno(), sz, dev) as end:
+    sz = 1
+    mem = mmap(-1, sz)
+    mem.write(b"\x01")
+    mem.flush()
+
+    with Endpoint(mem, sz, dev) as end:
         ret = socket.getaddrinfo(hostname,str(ip_port),0,
                                  socket.SOCK_STREAM);
         ret = ret[0];
@@ -103,7 +110,8 @@ def client_mode(hostname,infilename,dev):
             sock.send(pickle.dumps(infotype(path=path,
                                             addr=end.mr.addr,
                                             rkey=end.mr.rkey,
-                                            size=end.mem.size(),
+                                            # size=end.mem.size(),
+                                            size=sz,
                                             iters=1)))
             buf = sock.recv(1024)
             peerinfo = pickle.loads(buf)
@@ -131,7 +139,7 @@ def client_mode(hostname,infilename,dev):
         print "---sock close"
     print "--- endpoint close"
 
-def server_mode(outfilename, dev):
+def server_mode(mem, dev):
     ret = socket.getaddrinfo(None,str(ip_port),0,
                              socket.SOCK_STREAM,0,
                              socket.AI_PASSIVE);
@@ -142,64 +150,97 @@ def server_mode(outfilename, dev):
         sock.listen(1)
 
         print "Listening port..."
-        s,addr = sock.accept()
-        with contextlib.closing(s):
-            totalStartTime = time.time();
+        while True:
+            s,addr = sock.accept()
+            with contextlib.closing(s):
+                totalStartTime = time.time();
 
-            peerInfoStartTime = time.time();
-            buf = s.recv(1024)
-            peerinfo = pickle.loads(buf)
-            peerInfoEndTime = time.time();
-            print "sz = ", peerinfo.size
-            print "--peerinfo: elapsed = %f secs" % (peerInfoEndTime - peerInfoStartTime)
+                peerInfoStartTime = time.time();
+                buf = s.recv(1024)
+                peerinfo = pickle.loads(buf)
+                peerInfoEndTime = time.time();
+                print "sz = ", peerinfo.size
+                print "--peerinfo: elapsed = %f secs" % (peerInfoEndTime - peerInfoStartTime)
 
-            fseekStartTime = time.time();
-            f = open(outfilename, "w+")
-            f.seek(peerinfo.size - 1);
-            f.write("\0")
-            f.flush()
-            f.seek(0)
-            fseekEndTime = time.time();
-            print "--fseek  : elapsed = %f secs" % (fseekEndTime - fseekStartTime)
+                assert peerinfo.size == 1
 
-            endPointStartTime = time.time();
-            with Endpoint(f.fileno(), peerinfo.size, dev) as end:
-                with rdma.get_gmp_mad(end.ctx.end_port,verbs=end.ctx) as umad:
-                    end.path = peerinfo.path;
-                    end.path.end_port = end.ctx.end_port;
-                    rdma.path.fill_path(end.qp,end.path);
-                    rdma.path.resolve_path(umad,end.path);
+                # fseekStartTime = time.time();
+                # f = open(outfilename, "w+")
+                # f.seek(peerinfo.size - 1);
+                # f.write("\0")
+                # f.flush()
+                # f.seek(0)
+                # fseekEndTime = time.time();
+                # print "--fseek  : elapsed = %f secs" % (fseekEndTime - fseekStartTime)
 
-                s.send(pickle.dumps(infotype(path=end.path,
-                                             addr=end.mr.addr,
-                                             rkey=end.mr.rkey,
-                                             size=None,
-                                             iters=None)))
+                endPointStartTime = time.time();
+                # with Endpoint(f.fileno(), peerinfo.size, dev) as end:
+                with Endpoint(mem, peerinfo.size, dev) as end:
+                    with rdma.get_gmp_mad(end.ctx.end_port,verbs=end.ctx) as umad:
+                        end.path = peerinfo.path;
+                        end.path.end_port = end.ctx.end_port;
+                        rdma.path.fill_path(end.qp,end.path);
+                        rdma.path.resolve_path(umad,end.path);
 
-                print "path to peer %r\nMR peer raddr=%x peer rkey=%x"%(
-                    end.path,peerinfo.addr,peerinfo.rkey);
+                    s.send(pickle.dumps(infotype(path=end.path,
+                                                addr=end.mr.addr,
+                                                rkey=end.mr.rkey,
+                                                size=None,
+                                                iters=None)))
 
-                end.connect(peerinfo)
-                endPointEndTime = time.time();
-                print "--endpoint: elapsed = %f secs" % (endPointEndTime - endPointStartTime)
+                    print "path to peer %r\nMR peer raddr=%x peer rkey=%x"%(
+                        end.path,peerinfo.addr,peerinfo.rkey);
 
-                startTime = time.time();
+                    end.connect(peerinfo)
+                    endPointEndTime = time.time();
+                    print "--endpoint: elapsed = %f secs" % (endPointEndTime - endPointStartTime)
 
-                # Synchronize the transition to RTS
-                s.send("ready");
-                s.recv(1024);
+                    startTime = time.time();
 
-                s.shutdown(socket.SHUT_WR);
-                s.recv(1024);
+                    # Synchronize the transition to RTS
+                    s.send("ready");
+                    s.recv(1024);
 
-                endTime = time.time();
+                    s.shutdown(socket.SHUT_WR);
+                    s.recv(1024);
 
-                print "--xfer end: elapsed = %f secs" % (endTime - startTime)
-                print "--total   : elapsed = %f secs" % (endTime - totalStartTime)
-                #f = open(outfilename, "wb")
-                #data = end.mem.read(peerinfo.size)
-                #f.write(data)
-                f.close()
+                    endTime = time.time();
+
+                    print "--xfer end: elapsed = %f secs" % (endTime - startTime)
+                    print "--total   : elapsed = %f secs" % (endTime - totalStartTime)
+
+                    # f.close()
+
+
+class ThreadingExample(object):
+    """ Threading example class
+    The run() method will be started and it will run in the background
+    until the application exits.
+    """
+
+    def __init__(self, mmap, interval=1):
+        """ Constructor
+        :type interval: int
+        :param interval: Check interval, in seconds
+        """
+        self.interval = interval
+        self.mmap = mmap
+
+        thread = threading.Thread(target=self.run, args=())
+        thread.daemon = True                            # Daemonize thread
+        thread.start()                                  # Start the execution
+
+    def run(self):
+        """ Method that runs forever """
+        while True:
+            self.mmap.seek(0)
+            read_byte = self.mmap.read_byte()
+            if read_byte == b"\x01":
+                print "BYTE FOUND!"
+                self.mmap.seek(0)
+                self.mmap.write_byte(b"\x00")
+            time.sleep(self.interval/1000)
+
 
 def main():
 
@@ -211,7 +252,9 @@ def main():
     if len(sys.argv) == 3:
         client_mode(sys.argv[1], sys.argv[2], rdma.get_end_port())
     else:
-        server_mode(sys.argv[1], rdma.get_end_port())
+        mem = mmap(-1, 1)
+        thread = ThreadingExample(mem)
+        server_mode(mem, rdma.get_end_port())
     return True;
 
 main()
